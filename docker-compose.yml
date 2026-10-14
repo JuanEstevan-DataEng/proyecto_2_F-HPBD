@@ -1,0 +1,346 @@
+# =====================================================================================
+# Proyecto 2 - FyH para Big Data: Lakehouse Medallón (Bronze -> Silver -> Gold)
+#
+#   MinIO (object storage) · Nessie (catálogo, persistente en RocksDB) · Iceberg (tablas)
+#   Spark (procesamiento) · Airflow (orquestación) · dlt (ingesta) · Jupyter (ejecución manual)
+#   Trino y Dremio (motores SQL)
+#
+# Usuarios y claves se leen del archivo .env (copiar .env.example -> .env).
+# Despliegue: ver README.md
+# =====================================================================================
+
+# ================== BLOQUES COMUNES ==================
+
+x-spark-common: &spark-common
+  build:
+    context: .
+    dockerfile: Dockerfile.spark
+    target: spark
+  image: p2-spark:3.5.5-py39
+  user: root
+  volumes:
+    # el volumen spark-jars también lo monta Airflow para usar los mismos JARs en el spark-submit
+    - spark-jars:/opt/spark/jars
+    - ./jobs:/opt/spark/jobs
+  environment: &spark-env
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  networks:
+    - red_proyecto2
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: dockerfile
+  image: p2-airflow:2.9.0
+  environment: &airflow-common-env
+    # LocalExecutor: las tareas corren como procesos del scheduler, sin Redis ni workers de Celery
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:?definir en .env}:${POSTGRES_PASSWORD:?definir en .env}@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:?definir en .env}
+    # el driver de Spark (modo client) y dlt corren dentro de Airflow: necesitan acceso a MinIO
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    AWS_REGION: us-east-1
+    AWS_DEFAULT_REGION: us-east-1
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./plugins:/opt/airflow/plugins
+    - ./jobs:/opt/airflow/jobs
+    - spark-jars:/opt/spark/jars:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - red_proyecto2
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+# ================== SERVICIOS ==================
+services:
+
+  # ---------------------------------------------------------------- SPARK ----------
+  spark-master:
+    <<: *spark-common
+    container_name: p2_spark_master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "9090:8080"   # UI del master (aquí se ven los jobs que lanza Airflow)
+      - "7077:7077"   # puerto del clúster (spark://spark-master:7077)
+    environment:
+      <<: *spark-env
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+
+  spark-worker:
+    <<: *spark-common
+    container_name: p2_spark_worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    ports:
+      - "8081:8081"   # UI del worker
+    environment:
+      <<: *spark-env
+      # recursos que el worker ofrece al clúster (ajustar según la RAM del equipo)
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 3g
+      SPARK_WORKER_WEBUI_PORT: 8081
+
+  # ---------------------------------------------------------------- JUPYTER --------
+  # Ejecución manual alterna: bronze_ingest / silver_transform / gold_agg.ipynb.
+  # Misma imagen que Spark (etapa "jupyter"): mismas versiones y JARs que el clúster.
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+      target: jupyter
+    image: p2-jupyter:3.5.5-py39
+    container_name: p2_jupyter
+    user: root
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./jobs:/workspace/jobs
+      - ./scripts:/workspace/scripts
+      - ./consultas:/workspace/consultas
+      # Parquet descargados del dataset (solo para la carga manual de Bronze)
+      - ${DATOS_LOCALES:-./datos}:/datos
+    environment:
+      <<: *spark-env
+      SPARK_MASTER: spark://spark-master:7077
+      JOBS_DIR: /workspace/jobs
+    networks:
+      - red_proyecto2
+    depends_on:
+      - spark-master
+      - spark-worker
+    command: >
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
+      --ServerApp.token='' --ServerApp.password='' --notebook-dir=/workspace
+
+  # ---------------------------------------------------------------- MINIO ----------
+  minio:
+    # MinIO dejó de publicar imágenes públicas (quay.io/minio y minio/minio piden login).
+    # pgsty/minio es un build comunitario del mismo servidor, con el mismo comando y consola.
+    image: &minio-image pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    container_name: p2_minio
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # consola web
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?definir en .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?definir en .env}
+      MINIO_REGION_NAME: us-east-1
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    networks:
+      - red_proyecto2
+
+  # crea los buckets de la arquitectura medallón (si no existen) y termina
+  minio-init:
+    image: *minio-image
+    container_name: p2_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb --ignore-existing local/bronze &&
+      mc mb --ignore-existing local/silver &&
+      mc mb --ignore-existing local/gold &&
+      mc mb --ignore-existing local/warehouse"
+    networks:
+      - red_proyecto2
+
+  # ---------------------------------------------------------------- NESSIE ---------
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest
+    container_name: p2_nessie
+    # root para poder escribir en el volumen de RocksDB sin "Permission denied"
+    user: root
+    environment:
+      # Catálogo PERSISTENTE: por defecto Nessie usa IN_MEMORY y pierde las tablas al reiniciar
+      - nessie.version.store.type=ROCKSDB
+      - nessie.version.store.persist.rocks.database-path=/nessie/data
+      - nessie.server.authentication.enabled=false
+    volumes:
+      - nessie-data:/nessie/data
+    ports:
+      - "19120:19120"
+    networks:
+      - red_proyecto2
+
+  # ---------------------------------------------------------------- TRINO ----------
+  # Consulta las tablas de Silver para replicar Gold (consultas/trino_replica_gold.sql).
+  trino:
+    image: trinodb/trino:476
+    container_name: p2_trino
+    ports:
+      - "8085:8080"   # 8080 lo usa Airflow; en el host Trino queda en 8085
+    volumes:
+      # catálogo "iceberg" -> Nessie + MinIO (las credenciales llegan por variables de entorno)
+      - ./trino/catalog:/etc/trino/catalog:ro
+      # heap fijo de 2 GB y 1 GB por consulta (con el 80 % por defecto lo mataba el OOM)
+      - ./trino/config/config.properties:/etc/trino/config.properties:ro
+      - ./trino/config/jvm.config:/etc/trino/jvm.config:ro
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    mem_limit: 3g
+    depends_on:
+      - nessie
+      - minio
+    networks:
+      - red_proyecto2
+
+  # ---------------------------------------------------------------- DREMIO ---------
+  # Consulta las tablas de Gold. La fuente Nessie se crea con scripts/configurar_dremio.sh.
+  dremio:
+    image: dremio/dremio-oss:26.0
+    container_name: p2_dremio
+    ports:
+      - "9047:9047"     # UI web
+      - "31010:31010"   # JDBC/ODBC
+      - "32010:32010"   # Arrow Flight
+    environment:
+      DREMIO_MAX_MEMORY_SIZE_MB: 4096   # Dremio exige mínimo 4 GB
+    mem_limit: 5g
+    volumes:
+      - dremio-data:/opt/dremio/data
+    depends_on:
+      - nessie
+      - minio
+    networks:
+      - red_proyecto2
+
+  # ---------------------------------------------------------------- AIRFLOW --------
+  # base de metadatos de Airflow
+  postgres:
+    image: postgres:13
+    container_name: p2_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - red_proyecto2
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: p2_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: p2_airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8974/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: p2_airflow_triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # corre una sola vez: migra la BD, crea el usuario admin y la conexión spark_default
+  airflow-init:
+    <<: *airflow-common
+    container_name: p2_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/{logs,dags,plugins,config,jobs}
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins,config,jobs}
+        /entrypoint airflow db migrate
+        /entrypoint airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:?definir en .env}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:?definir en .env}" \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+        /entrypoint airflow connections add 'spark_default' \
+          --conn-type 'spark' \
+          --conn-host 'spark://spark-master' \
+          --conn-port 7077 \
+          --conn-extra '{"deploy-mode": "client"}' || true
+    user: "0:0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# ================== VOLÚMENES Y RED ==================
+volumes:
+  minio-data:          # objetos de bronze / silver / gold
+  nessie-data:         # RocksDB del catálogo (persistente)
+  dremio-data:         # configuración de Dremio (usuario, fuente Nessie)
+  postgres-db-volume:  # metadatos de Airflow
+  spark-jars:          # JARs de Spark compartidos con Airflow
+
+networks:
+  red_proyecto2:
+    driver: bridge
