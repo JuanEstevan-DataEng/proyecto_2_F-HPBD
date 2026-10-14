@@ -1,0 +1,61 @@
+# Imagen de Spark del proyecto (master, worker) y, en la etapa "jupyter", la de Jupyter.
+# Jupyter sale de la misma imagen para que el driver del notebook tenga la misma versión de
+# Spark (3.5.5), de Python (3.9) y los mismos JARs que el clúster.
+
+# ================== ETAPA BASE: SPARK ==================
+FROM apache/spark:3.5.5 AS spark
+
+USER root
+
+# 1. Python 3.9 y herramientas básicas
+RUN apt-get update && \
+    apt-get install -y \
+        python3.9 \
+        python3.9-distutils \
+        python3.9-venv \
+        curl \
+        wget \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.9 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.9 1 \
+    && curl https://bootstrap.pypa.io/pip/3.9/get-pip.py -o get-pip.py \
+    && python3 get-pip.py \
+    && rm get-pip.py \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Variables de entorno
+ENV PYSPARK_PYTHON=python3
+ENV PYSPARK_DRIVER_PYTHON=python3
+
+# 3. JARs de Iceberg, Nessie y S3 (se descargan al construir la imagen, no en cada sesión)
+WORKDIR /opt/spark/jars
+
+# Iceberg y Nessie
+RUN wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.0/iceberg-spark-runtime-3.5_2.12-1.5.0.jar && \
+    wget -q https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.77.1/nessie-spark-extensions-3.5_2.12-0.77.1.jar
+# Hadoop AWS y SDKs de AWS (estas versiones deben coincidir entre sí)
+RUN wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar && \
+    wget -q https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar && \
+    wget -q https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/2.24.8/bundle-2.24.8.jar && \
+    wget -q https://repo1.maven.org/maven2/software/amazon/awssdk/url-connection-client/2.24.8/url-connection-client-2.24.8.jar
+
+# 4. Configuración por defecto de Spark (catálogo Nessie, S3A hacia MinIO)
+COPY spark-defaults.conf /opt/spark/conf/spark-defaults.conf
+
+# 5. Librerías de Python para los workers
+RUN pip install --no-cache-dir pandas boto3 pyspark==3.5.5 pyarrow
+
+RUN chown -R spark:spark /opt/spark/jars /opt/spark/conf
+USER spark
+WORKDIR /opt/spark/work-dir
+
+# ================== ETAPA JUPYTER ==================
+FROM spark AS jupyter
+
+USER root
+# JupyterLab + dlt (para correr bronze_ingest a mano) + s3fs
+RUN pip install --no-cache-dir jupyterlab "dlt[filesystem,parquet]" s3fs requests
+RUN mkdir -p /workspace && chown -R spark:spark /workspace
+USER spark
+WORKDIR /workspace
+ENV HOME=/workspace
