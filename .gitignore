@@ -1,0 +1,12 @@
+# Secretos (solo se versiona .env.example)
+.env
+.dlt/secrets.toml
+
+# Datos y estado local
+datos/
+logs/
+minio-data/
+nessie-data/
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
