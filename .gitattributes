@@ -1,0 +1,11 @@
+# Los scripts de shell deben tener finales de línea LF aunque se clone en Windows:
+# con CRLF, bash falla con "set: pipefail\r: invalid option name".
+*.sh   text eol=lf
+*.py   text eol=lf
+*.conf text eol=lf
+*.properties text eol=lf
+jvm.config   text eol=lf
+.env.example text eol=lf
+Dockerfile*  text eol=lf
+dockerfile   text eol=lf
+*.yml  text eol=lf

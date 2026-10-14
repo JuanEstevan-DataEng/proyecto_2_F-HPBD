@@ -100,13 +100,25 @@ docker compose exec spark-master /opt/spark/bin/spark-submit \
     /opt/spark/jobs/silver_post_hist_manual.py
 ```
 
+**En Windows:**
+- La descarga tiene versión para PowerShell (no necesita Git Bash):
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File scripts\descargar_dataset.ps1
+  ```
+- Si se usa Git Bash y aparece `set: pipefail\r: invalid option name` (o `$'\r': command not found`), el archivo quedó con finales de línea de Windows (CRLF). El `.gitattributes` del repo fuerza LF en los `.sh`; si el clon es anterior, se corrige con:
+  ```bash
+  git rm --cached -r . -q && git reset --hard      # vuelve a sacar los archivos con LF
+  # o, solo para un archivo:  sed -i 's/\r$//' scripts/descargar_dataset.sh
+  ```
+- Los comandos `docker compose exec …` son iguales en PowerShell; en una sola línea, sin las `\` de continuación.
+
 ### 4.3 Configurar Dremio (una sola vez)
 
 ```bash
 bash scripts/configurar_dremio.sh
 ```
 
-Crea el usuario administrador y la fuente **`nessie`**. Para hacerlo a mano en la UI: *Add Source → Nessie*:
+Crea el usuario administrador y la fuente **`nessie`**. Requiere bash y `python3` (en Windows: Git Bash con Python instalado; si no, hacerlo desde la UI como se indica a continuación). Para hacerlo a mano en la UI: *Add Source → Nessie*:
 - **General:** endpoint `http://nessie:19120/api/v2`, autenticación `None`.
 - **Storage:** AWS root path `/warehouse`, Access Key y Secret con las claves de MinIO, *Encrypt connection* desactivado.
 - **Propiedades:** `fs.s3a.endpoint=minio:9000`, `fs.s3a.path.style.access=true`, `dremio.s3.compat=true`.
@@ -239,6 +251,7 @@ docker exec p2_trino trino --execute 'SELECT committed_at, operation FROM iceber
 ├── requirements.txt            # librerías extra de Airflow
 ├── spark-defaults.conf         # catálogo Nessie y S3A por defecto en Spark
 ├── .env.example                # plantilla de usuarios y claves (copiar a .env)
+├── .gitattributes              # fuerza finales de línea LF (scripts .sh en Windows)
 ├── dags/
 │   └── dag_medallon_stackoverflow.py   # DAG: bronze_ingest >> silver_transform >> gold_agg
 ├── jobs/                       # lógica compartida por Airflow y Jupyter
@@ -251,6 +264,7 @@ docker exec p2_trino trino --execute 'SELECT committed_at, operation FROM iceber
 ├── consultas/                  # trino_replica_gold.sql · dremio_gold.sql
 ├── scripts/
 │   ├── descargar_dataset.sh    # descarga los Parquet de la carga manual
+│   ├── descargar_dataset.ps1   # lo mismo, para Windows (PowerShell)
 │   ├── bronze_manual.py        # sube posts_2020/2021 y votes_2020 a Bronze
 │   ├── configurar_dremio.sh    # usuario admin + fuente Nessie en Dremio
 │   ├── reiniciar_tablas.py     # borra las tablas Iceberg (catálogo + archivos) para empezar de cero
