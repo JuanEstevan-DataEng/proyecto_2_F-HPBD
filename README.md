@@ -165,13 +165,54 @@ Las consultas están numeradas en pares (1 ↔ 1, 2 ↔ 2…):
 | 4 | Un registro: post `59837318` | 172 votos · 162 positivos · 9 negativos |
 | 5 (Trino) | `EXCEPT` réplica vs Gold en los dos sentidos | **0 y 0** |
 
-**Trino desde DBeaver:** Nueva conexión → *Trino*, host `localhost`, puerto `8085`, usuario `admin`, sin clave. Catálogo `iceberg`, esquemas `silver` y `gold`.
-**Trino desde la consola:** `docker exec -it p2_trino trino`, luego `SHOW TABLES FROM iceberg.silver;`.
-**Dremio:** http://localhost:9047 → *SQL Runner*, ejecutar las consultas de `dremio_gold.sql`.
+### 7.1 Cómo ejecutar las consultas de Trino (dos opciones)
+
+> La interfaz web de Trino (http://localhost:8085/ui/, cualquier usuario, sin clave) **solo sirve para monitorear**: muestra las consultas ejecutadas, su estado, tiempo y filas leídas/devueltas, pero **no muestra el resultado ni permite escribir SQL**. Las consultas se ejecutan desde DBeaver o desde la consola.
+
+**Opción A · DBeaver**
+
+1. *Nueva conexión* → **Trino** → host `localhost`, puerto **`8085`**, usuario `admin`, contraseña vacía (sin SSL). La primera vez pide descargar el driver.
+2. *Probar conexión* → *Connected*. En el navegador aparecen `iceberg → silver` (`post_hist`, `votes_hist`) e `iceberg → gold` (`vote_stats_per_post`).
+3. *Archivo → Abrir archivo…* → `consultas/trino_replica_gold.sql` y seleccionar la conexión Trino como origen de datos activo.
+4. **Ctrl+Enter** ejecuta la consulta donde está el cursor; **Alt+X** ejecuta todo el script (un resultado por pestaña).
+
+**Opción B · Consola (`docker exec`)**, sin instalar nada:
+
+```bash
+# todas las consultas del archivo, de una vez
+docker exec -i p2_trino trino --output-format ALIGNED < consultas/trino_replica_gold.sql
+
+# consola interactiva (pegar consultas a mano)
+docker exec -it p2_trino trino
+
+# una consulta suelta
+docker exec p2_trino trino --execute "SELECT COUNT(*) FROM iceberg.gold.vote_stats_per_post"
+```
+
+### 7.2 Dremio
+
+http://localhost:9047 → iniciar sesión con `DREMIO_USER` → fuente **nessie** en el panel izquierdo → **SQL Runner** → ejecutar las consultas de `consultas/dremio_gold.sql` (una a la vez).
 
 ---
 
-## 8. Verificaciones para la presentación
+## 8. Presentación (demo en vivo)
+
+**Antes de la clase (mínimo 1 hora antes):** `docker compose up -d`, esperar 1–2 minutos a que Airflow y Dremio respondan y ejecutar el DAG (▶). Así se llega con los datos frescos y las 3 tareas en verde. Si durante la presentación algo no cuadra, el DAG completo se puede volver a correr en vivo (≈ 2–3 minutos).
+
+| # | Qué se muestra | Dónde / cómo | Qué se debe ver |
+|---|---|---|---|
+| 1 | Arquitectura implementada | `docs/arquitectura.png` | Capas Bronze/Silver/Gold y la función de cada herramienta |
+| 2 | Servicios corriendo | `docker compose ps` | Todos `Up`; `minio-init` y `airflow-init` en `Exited (0)` (corren una vez) |
+| 3 | Ejecución del pipeline | Airflow (8080) → `medallon_stackoverflow` → *Graph* | `bronze_ingest` → `silver_transform` → `gold_agg` en verde; en el log de `bronze_ingest`: dlt con `replace` |
+| 4 | Jobs enviados al clúster de Spark | Spark UI (9090) → *Completed Applications* | `silver_transform` y `gold_agg` en `FINISHED`, lanzados por `SparkSubmitOperator` |
+| 5 | Tablas en el object storage | Consola de MinIO (9001) | Solo las rutas del proyecto (`bronze/posts`, `bronze/votes`, `silver/post_hist`, `silver/votes_hist`, `gold/vote_stats_per_post`), sin duplicados aunque el DAG se haya corrido varias veces |
+| 6 | Catálogo persistente | `docker compose restart nessie` y volver a consultar en Trino | Las tablas siguen registradas (Nessie con RocksDB) |
+| 7 | **Trino → Silver: réplica de Gold** | DBeaver (opción A) **o** `docker exec` (opción B) con `consultas/trino_replica_gold.sql` | Consulta 2: **1.062.656 filas**; consulta 4: post `59837318` con **172 / 162 / 9**; consulta 5: **0 y 0** |
+| 8 | **Dremio → Gold** | SQL Runner con `consultas/dremio_gold.sql` | Consultas 2 y 4 con **los mismos valores** que en Trino, más la columna `fecha_cargue` |
+| 9 | Monitoreo de las consultas (opcional) | Web UI de Trino (8085/ui) | Las consultas del paso 7 en `FINISHED`, con filas leídas y tiempo |
+| — | Respaldo si falla Airflow | Jupyter (8888) → `notebooks/` → *Run All* | El notebook de la etapa que falló produce el mismo resultado que la tarea del DAG |
+
+### Comandos útiles durante la demo
 
 ```bash
 docker compose ps                                                     # servicios arriba
@@ -182,10 +223,10 @@ docker compose exec minio sh -c 'mc alias set l http://localhost:9000 $MINIO_ROO
 curl -s localhost:19120/api/v2/trees/main/entries                     # tablas registradas en Nessie
 docker compose restart nessie                                          # el catálogo persiste (RocksDB):
 docker exec p2_trino trino --execute "SELECT count(*) FROM iceberg.gold.vote_stats_per_post"   # sigue respondiendo
-```
 
-- En MinIO solo hay rutas de las tablas del proyecto: `bronze/posts/*`, `bronze/votes/*` (más `_dlt_*`, el control de dlt), `silver/post_hist`, `silver/votes_hist` y `gold/vote_stats_per_post`.
-- Historial de MERGE de cada tabla (en Trino): `SELECT * FROM iceberg.gold."vote_stats_per_post$snapshots";`
+# historial de MERGE (snapshots de Iceberg) de una tabla
+docker exec p2_trino trino --execute 'SELECT committed_at, operation FROM iceberg.gold."vote_stats_per_post$snapshots"'
+```
 
 ---
 
